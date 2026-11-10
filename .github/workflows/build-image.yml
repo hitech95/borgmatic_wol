@@ -1,0 +1,121 @@
+name: Build and publish image
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'Dockerfile'
+      - 'borgmatic-wol-hook.sh'
+      - '.github/workflows/build-image.yml'
+
+env:
+  UPSTREAM_IMAGE: ghcr.io/borgmatic-collective/borgmatic
+  UPSTREAM_TAG: latest
+  DIGEST_FILE: .upstream-digest
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          repo="${UPSTREAM_IMAGE}"
+          token="$(curl -fsSL \
+            "https://ghcr.io/token?scope=repository:${repo#ghcr.io/}:pull" \
+            | jq -r .token)"
+          digest="$(curl -fsSL \
+            -H "Authorization: Bearer ${token}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            -D - -o /dev/null \
+            "https://ghcr.io/v2/${repo#ghcr.io/}/manifests/${UPSTREAM_TAG}" \
+            | tr -d '\r' \
+            | awk 'tolower($1)=="docker-content-digest:"{print $2}')"
+          [ -n "${digest}" ] || { echo "Failed to resolve upstream digest"; exit 1; }
+          previous="$(test -f "${DIGEST_FILE}" && cat "${DIGEST_FILE}" || echo none)"
+          echo "current=${digest}"  >> "$GITHUB_OUTPUT"
+          echo "previous=${previous}" >> "$GITHUB_OUTPUT"
+          echo "::notice::upstream=${digest} previous=${previous}"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          build=false
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && build=true
+          [ "${{ github.event_name }}" = "push" ] && build=true
+          [ "${{ steps.digest.outputs.current }}" != "${{ steps.digest.outputs.previous }}" ] && build=true
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "::notice::build=${build} (event=${{ github.event_name }})"
+
+      - name: Exit early (upstream unchanged)
+        if: steps.decide.outputs.build == 'false'
+        run: echo "No rebuild needed; upstream digest unchanged."
+
+      - name: Set up QEMU
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        if: steps.decide.outputs.build == 'true'
+        id: tags
+        run: |
+          set -euo pipefail
+          repo="$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          ghcr="ghcr.io/${repo}"
+          short="$(echo "${{ steps.digest.outputs.current }}" | cut -d: -f2 | cut -c1-12)"
+          tags="${ghcr}:latest,${ghcr}:upstream-${short},${ghcr}:sha-${GITHUB_SHA::7}"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            UPSTREAM_IMAGE=${{ env.UPSTREAM_IMAGE }}
+            UPSTREAM_TAG=${{ env.UPSTREAM_TAG }}
+
+      - name: Record upstream digest
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          echo "${{ steps.digest.outputs.current }}" > "${DIGEST_FILE}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${DIGEST_FILE}"
+          git commit -m "chore: track upstream digest ${{ steps.digest.outputs.current }}" \
+            || { echo "Nothing to commit"; exit 0; }
+          git push
